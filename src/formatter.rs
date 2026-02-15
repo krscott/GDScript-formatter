@@ -53,6 +53,7 @@ struct Formatter {
     input_tree: GdTree,
     tree: Tree,
     original_source: Option<String>,
+    preserved_regions: Vec<String>,
 }
 
 impl Formatter {
@@ -64,22 +65,15 @@ impl Formatter {
             .unwrap();
         let tree = parser.parse(&content, None).unwrap();
         let input_tree = GdTree::from_ts_tree(&tree, content.as_bytes());
-        let original_source = if config.safe && config.reorder_code {
-            // When both safe mode and reordering are enabled we keep an
-            // untouched copy of the original source code so we can later verify
-            // that the top-level declarations all survive the formatting pass.
-            Some(content.clone())
-        } else {
-            None
-        };
 
         Self {
-            original_source,
+            original_source: None,
             content,
             config,
             tree,
             input_tree,
             parser,
+            preserved_regions: Vec::new(),
         }
     }
 
@@ -152,7 +146,91 @@ impl Formatter {
     /// pre-applying rules that could be performance-intensive through topiary.
     #[inline(always)]
     fn preprocess(&mut self) -> &mut Self {
+        self.extract_format_off_regions();
+
+        // After placeholder substitution, rebuild the tree and input_tree so
+        // that safe mode compares like-for-like (both sides see placeholders).
+        self.tree = self.parser.parse(&self.content, None).unwrap();
+        self.input_tree = GdTree::from_ts_tree(&self.tree, self.content.as_bytes());
+
+        // Store a copy of the preprocessed content (with placeholders) for
+        // ensure_safe_reorder() so both sides of that comparison see placeholders
+        // in the same positions.
+        if self.config.safe && self.config.reorder_code {
+            self.original_source = Some(self.content.clone());
+        }
+
         self
+    }
+
+    /// Scans `self.content` for `# gdformat: off` / `# gdformat: on` comment
+    /// pairs. Each matched region (from the start of the off-line through the
+    /// end of the on-line, inclusive) is replaced with a single placeholder
+    /// comment `# __gdformat_preserved_N__` and the original text is stored in
+    /// `self.preserved_regions`. An `off` without a matching `on` extends to
+    /// end-of-file.
+    fn extract_format_off_regions(&mut self) {
+        let off_re = RegexBuilder::new(r"^\s*#\s*gdformat:\s*off\s*$")
+            .case_insensitive(true)
+            .build()
+            .expect("format-off regex should compile");
+        let on_re = RegexBuilder::new(r"^\s*#\s*gdformat:\s*on\s*$")
+            .case_insensitive(true)
+            .build()
+            .expect("format-on regex should compile");
+
+        // Clear any previously stored regions (extract may be called more than
+        // once during the pipeline, e.g. in finish() for the blank-line pass).
+        self.preserved_regions.clear();
+
+        // Collect (start_byte, end_byte) ranges for each off/on region.
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut off_start: Option<usize> = None;
+
+        let mut byte_offset = 0usize;
+        for line in self.content.split('\n') {
+            let line_end = byte_offset + line.len(); // position of the '\n' (or EOF)
+            if off_start.is_none() {
+                if off_re.is_match(line) {
+                    off_start = Some(byte_offset);
+                }
+            } else if on_re.is_match(line) {
+                regions.push((off_start.unwrap(), line_end));
+                off_start = None;
+            }
+            byte_offset = line_end + 1; // +1 for the '\n'
+        }
+
+        // An `off` without a matching `on` extends to end-of-file.
+        if let Some(start) = off_start {
+            regions.push((start, self.content.len()));
+        }
+
+        if regions.is_empty() {
+            return;
+        }
+
+        // Replace regions back-to-front so byte offsets stay valid.
+        for (i, &(start, end)) in regions.iter().enumerate().rev() {
+            let original = &self.content[start..end];
+            self.preserved_regions.push(original.to_string());
+
+            // Preserve the leading whitespace of the `# gdformat: off` line so
+            // that the placeholder sits at the same indentation level.  This
+            // prevents Topiary from mis-interpreting the scope (e.g. a
+            // placeholder at column 0 inside a class body would break
+            // indentation of subsequent lines).
+            let leading_ws: String = original
+                .chars()
+                .take_while(|c| c.is_whitespace() && *c != '\n')
+                .collect();
+            let placeholder = format!("{}# __gdformat_preserved_{}__", leading_ws, i);
+            self.content.replace_range(start..end, &placeholder);
+        }
+
+        // The preserved_regions were pushed in reverse order; flip them so
+        // index 0 corresponds to placeholder 0.
+        self.preserved_regions.reverse();
     }
 
     /// This function runs over the content after going through topiary. We use it
@@ -198,9 +276,53 @@ impl Formatter {
     }
 
     /// Finishes formatting and returns the resulting file content.
+    /// Restores any `# gdformat: off` / `# gdformat: on` regions that were
+    /// replaced with placeholders during preprocessing.
     #[inline(always)]
-    fn finish(self) -> Result<String, Box<dyn std::error::Error>> {
+    fn finish(mut self) -> Result<String, Box<dyn std::error::Error>> {
+        if self.preserved_regions.is_empty() {
+            return Ok(self.content);
+        }
+
+        self.restore_format_off_regions();
+
+        // Run the two-blank-line pass now that the real code is back in place.
+        // This was deferred from postprocess_tree_sitter() so that spacing is
+        // computed from the actual content, not the single-line placeholders.
+        // We must also protect the restored regions from modification: the
+        // blank-line handler might insert newlines *inside* a preserved block.
+        // To handle this we re-extract the off/on regions (turning them back
+        // into placeholders), run the blank-line handler on the safe
+        // placeholder content, and then restore once more.
+        self.extract_format_off_regions();
+        self.tree = self.parser.parse(&self.content, None).unwrap();
+        self.handle_two_blank_line();
+        self.fix_trailing_spaces();
+        self.restore_format_off_regions();
+
         Ok(self.content)
+    }
+
+    /// Replaces each `# __gdformat_preserved_N__` placeholder line (including
+    /// any leading whitespace added by Topiary or post-processing) with the
+    /// original verbatim text stored in `self.preserved_regions`.
+    fn restore_format_off_regions(&mut self) {
+        if self.preserved_regions.is_empty() {
+            return;
+        }
+
+        let placeholder_re = RegexBuilder::new(r"^[^\S\n]*# __gdformat_preserved_(\d+)__\s*$")
+            .multi_line(true)
+            .build()
+            .expect("placeholder regex should compile");
+
+        let regions = &self.preserved_regions;
+        self.content = placeholder_re
+            .replace_all(&self.content, |caps: &regex::Captures| {
+                let index: usize = caps[1].parse().unwrap();
+                regions[index].to_string()
+            })
+            .into_owned();
     }
 
     /// This function adds additional new line characters after `extends_statement`.
@@ -480,7 +602,15 @@ impl Formatter {
     fn postprocess_tree_sitter(&mut self) -> &mut Self {
         self.tree = self.parser.parse(&self.content, None).unwrap();
 
-        self.handle_two_blank_line()
+        // When format-off regions are active, defer the two-blank-line pass
+        // until after placeholders are restored in finish().  Running it now
+        // would compute spacing based on single-line placeholder comments
+        // instead of the actual multi-line preserved blocks, which leads to
+        // inconsistent blank-line placement and breaks idempotency.
+        if self.preserved_regions.is_empty() {
+            self.handle_two_blank_line();
+        }
+        self
     }
 
     /// Replaces every match of regex `re` with `rep`, but only if the match is
